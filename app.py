@@ -44,7 +44,7 @@ PENN_TO_INJURY = {
 EMOJIS = ['⚾','⚾','🏋️','🎳','🏋️','⛳','🪢','🤸','💪','💪','🧘','🏋️','🎸','🎾','🎾']
 IMG_SIZE = (224, 224)
 
-# ── Transform IDENTIQUE à l'entraînement ─────────────────────────
+# ── Transform IDENTIQUE à l'entraînement ──────────────────────
 transform = transforms.Compose([
     transforms.Resize(256),
     transforms.CenterCrop(224),
@@ -52,41 +52,66 @@ transform = transforms.Compose([
     transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
 ])
 
-# ── Reconstruction de l'architecture ─────────────────────────────
+# ── Reconstruction des architectures ──────────────────────────
 def build_model(arch, num_classes):
-    if arch in ('resnet50','baseline','p4_bal','p3_adamw','p1_aug','p2_arch'):
-        m = models.resnet50(weights=None)
-        f = m.fc.in_features
-        m.fc = nn.Sequential(nn.Dropout(0.3), nn.Linear(f, num_classes))
-    elif arch == 'p5_ft':
+    """
+    Reconstruit EXACTEMENT la même tête que dans le notebook Kaggle.
+
+    Notebook build_baseline_model() → Linear(512)+BN+ReLU+Dropout(0.5)+Linear
+    Notebook build_model_p2()       → Dropout(0.3)+Linear  (EfficientNet)
+    Notebook p5_ft                  → Linear(512)+BN+ReLU+Dropout(0.4)+Linear
+    """
+    if arch in ('resnet50', 'baseline', 'p3_adamw', 'p4_bal'):
+        # Tête de build_baseline_model() dans le notebook
         m = models.resnet50(weights=None)
         f = m.fc.in_features
         m.fc = nn.Sequential(
-            nn.Linear(f,512), nn.BatchNorm1d(512),
+            nn.Linear(f, 512), nn.BatchNorm1d(512),
+            nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(512, num_classes)
+        )
+
+    elif arch == 'p5_ft':
+        # Tête de la Piste 5 (fine-tuning)
+        m = models.resnet50(weights=None)
+        f = m.fc.in_features
+        m.fc = nn.Sequential(
+            nn.Linear(f, 512), nn.BatchNorm1d(512),
             nn.ReLU(), nn.Dropout(0.4),
             nn.Linear(512, num_classes)
         )
-    elif arch == 'efficientnet_b0':
+
+    elif arch in ('efficientnet_b0', 'p2_arch'):
         m = models.efficientnet_b0(weights=None)
         f = m.classifier[1].in_features
         m.classifier = nn.Sequential(nn.Dropout(0.3), nn.Linear(f, num_classes))
+
     elif arch == 'efficientnet_b2':
         m = models.efficientnet_b2(weights=None)
         f = m.classifier[1].in_features
         m.classifier = nn.Sequential(nn.Dropout(0.4), nn.Linear(f, num_classes))
+
     elif arch == 'densenet121':
         m = models.densenet121(weights=None)
         f = m.classifier.in_features
         m.classifier = nn.Sequential(nn.Dropout(0.4), nn.Linear(f, num_classes))
+
     else:
+        # Fallback : même tête que baseline
         m = models.resnet50(weights=None)
         f = m.fc.in_features
-        m.fc = nn.Sequential(nn.Dropout(0.3), nn.Linear(f, num_classes))
+        m.fc = nn.Sequential(
+            nn.Linear(f, 512), nn.BatchNorm1d(512),
+            nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(512, num_classes)
+        )
     return m
+
 
 @st.cache_resource
 def load_model(model_path):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     if not os.path.exists(model_path):
         m = build_model('resnet50', 15)
         m.eval().to(device)
@@ -99,14 +124,22 @@ def load_model(model_path):
 
     model = build_model(arch, num_classes)
 
-    # Gérer DataParallel (clés 'module.xxx')
+    # Gérer DataParallel (clés préfixées 'module.')
     state = ckpt['model_state_dict']
     if any(k.startswith('module.') for k in state.keys()):
-        state = {k.replace('module.',''):v for k,v in state.items()}
+        state = {k.replace('module.', ''): v for k, v in state.items()}
 
-    model.load_state_dict(state, strict=False)
+    try:
+        model.load_state_dict(state, strict=True)
+        load_status = "strict"
+    except RuntimeError:
+        model.load_state_dict(state, strict=False)
+        load_status = "partial"
+
     model.eval().to(device)
-    return model, device, f"✅ arch={arch} | Val Acc={val_acc:.2%}", arch, val_acc
+    status = f"✅ arch={arch} | Val Acc={val_acc:.2%} | load={load_status}"
+    return model, device, status, arch, val_acc
+
 
 def predict(pil_img, model, device):
     t = transform(pil_img).unsqueeze(0).to(device)
@@ -115,33 +148,39 @@ def predict(pil_img, model, device):
     idx = int(np.argmax(probs))
     return idx, float(probs[idx]), probs
 
+
 def gradcam(model, device, pil_img, pred_idx, arch):
     t = transform(pil_img).unsqueeze(0).to(device)
     acts, grads = {}, {}
-    # Couche cible selon architecture
+
     if 'efficientnet' in arch:
         layer = model.features[-1]
     elif 'densenet' in arch:
         layer = model.features.denseblock4
     else:
-        layer = model.layer4[-1]
+        layer = model.layer4[-1]  # ResNet50
 
-    h1 = layer.register_forward_hook(lambda m,i,o: acts.update({'f':o}))
-    h2 = layer.register_full_backward_hook(lambda m,gi,go: grads.update({'f':go[0]}))
+    h1 = layer.register_forward_hook(lambda m, i, o: acts.update({'f': o}))
+    h2 = layer.register_full_backward_hook(lambda m, gi, go: grads.update({'f': go[0]}))
+
     model.eval()
     out = model(t)
     model.zero_grad()
     out[0, pred_idx].backward()
     h1.remove(); h2.remove()
 
-    w   = grads['f'].mean(dim=[2,3], keepdim=True)
-    hm  = torch.relu((w * acts['f']).sum(dim=1).squeeze()).detach().cpu().numpy()
-    hm  = (hm - hm.min()) / (hm.max() - hm.min() + 1e-8)
+    w  = grads['f'].mean(dim=[2, 3], keepdim=True)
+    hm = torch.relu((w * acts['f']).sum(dim=1).squeeze()).detach().cpu().numpy()
+    hm = (hm - hm.min()) / (hm.max() - hm.min() + 1e-8)
+
     img = np.array(pil_img.resize(IMG_SIZE)).astype(np.float32) / 255.0
     hm2 = cv2.resize(hm, IMG_SIZE)
-    col = cv2.cvtColor(cv2.applyColorMap(np.uint8(255*hm2), cv2.COLORMAP_JET),
-                       cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    return np.clip(0.55*img + 0.45*col, 0, 1), hm2
+    col = cv2.cvtColor(
+        cv2.applyColorMap(np.uint8(255 * hm2), cv2.COLORMAP_JET),
+        cv2.COLOR_BGR2RGB
+    ).astype(np.float32) / 255.0
+    return np.clip(0.55 * img + 0.45 * col, 0, 1), hm2
+
 
 # ─── UI ──────────────────────────────────────────────────────────
 st.title("🏋️ Penn Action — Analyse d'Exercice Sportif")
@@ -155,7 +194,7 @@ with st.sidebar:
     st.divider()
     st.markdown("**15 classes :**")
     for e, a in zip(EMOJIS, ACTIONS):
-        st.markdown(f"{e} {a.replace('_',' ')}")
+        st.markdown(f"{e} {a.replace('_', ' ')}")
 
 model, device, status, arch, val_acc = load_model(model_path)
 st.info(status)
@@ -182,25 +221,29 @@ if uploaded:
         st.progress(conf, text=f"Confiance : {conf:.1%}")
         st.divider()
         st.markdown("**🩺 Risque de blessure**")
-        r1,r2,r3 = st.columns(3)
-        r1.metric("Zone", zone)
-        r2.metric("Niveau", f"{emoji} {risk}")
+        r1, r2, r3 = st.columns(3)
+        r1.metric("Zone",      zone)
+        r2.metric("Niveau",    f"{emoji} {risk}")
         r3.metric("Confiance", f"{conf:.1%}")
 
     if show_topk:
         st.divider()
         st.subheader("📊 Top-5 prédictions")
-        top5 = np.argsort(probs)[::-1][:5]
-        fig, ax = plt.subplots(figsize=(10,3))
-        cols_bar = ['#3b82f6' if i==0 else '#94a3b8' for i in range(5)]
-        acts_r = [ACTIONS[i].replace('_',' ') for i in top5][::-1]
-        prob_r = [float(probs[i]) for i in top5][::-1]
+        top5   = np.argsort(probs)[::-1][:5]
+        fig, ax = plt.subplots(figsize=(10, 3))
+        cols_bar = ['#3b82f6' if i == 0 else '#94a3b8' for i in range(5)]
+        acts_r  = [ACTIONS[i].replace('_', ' ') for i in top5][::-1]
+        prob_r  = [float(probs[i]) for i in top5][::-1]
         bars = ax.barh(acts_r, prob_r, color=cols_bar[::-1], edgecolor='black', linewidth=0.5)
-        ax.set_xlim(0,1); ax.set_xlabel('Probabilité')
+        ax.set_xlim(0, 1)
+        ax.set_xlabel('Probabilité')
         ax.axvline(0.5, color='red', linestyle='--', alpha=0.4)
         for bar, v in zip(bars, prob_r):
-            ax.text(bar.get_width()+0.01, bar.get_y()+bar.get_height()/2, f'{v:.1%}', va='center', fontsize=10)
-        plt.tight_layout(); st.pyplot(fig); plt.close()
+            ax.text(bar.get_width() + 0.01, bar.get_y() + bar.get_height()/2,
+                    f'{v:.1%}', va='center', fontsize=10)
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
 
     if show_gradcam:
         st.divider()
@@ -208,19 +251,19 @@ if uploaded:
         st.caption("Zones rouges/jaunes = ce que le modèle regarde pour décider.")
         try:
             overlay, hm = gradcam(model, device, pil_img, pred_idx, arch)
-            g1,g2,g3 = st.columns(3)
-            g1.image(np.array(pil_img.resize(IMG_SIZE)), caption="Originale", use_container_width=True)
-            g2.image((hm*255).astype(np.uint8), caption="Heatmap", use_container_width=True)
-            g3.image((overlay*255).astype(np.uint8), caption="Overlay", use_container_width=True)
+            g1, g2, g3 = st.columns(3)
+            g1.image(np.array(pil_img.resize(IMG_SIZE)), caption="Originale",  use_container_width=True)
+            g2.image((hm * 255).astype(np.uint8),        caption="Heatmap",    use_container_width=True)
+            g3.image((overlay * 255).astype(np.uint8),   caption="Overlay",    use_container_width=True)
         except Exception as e:
             st.warning(f"Grad-CAM indisponible : {e}")
 
     st.divider()
     st.subheader("🔗 Connexion projet Injury")
     ex_type = PENN_TO_INJURY.get(action, 'HIIT')
-    i1,i2 = st.columns(2)
+    i1, i2 = st.columns(2)
     i1.metric("Exercise Type (ANN)", ex_type)
-    i2.metric("Action CNN", action.replace('_',' '))
+    i2.metric("Action CNN",          action.replace('_', ' '))
     st.code(f"profile = {{'exercise_type': '{ex_type}', 'age': 28, 'BMI': 24.5, ...}}", language='python')
 
 else:
@@ -230,8 +273,8 @@ else:
     st.divider()
     st.subheader("🎯 15 classes reconnues")
     cols = st.columns(5)
-    for i,(a,e) in enumerate(zip(ACTIONS, EMOJIS)):
-        cols[i%5].markdown(f"""<div style="text-align:center;padding:10px;background:#f8fafc;
+    for i, (a, e) in enumerate(zip(ACTIONS, EMOJIS)):
+        cols[i % 5].markdown(f"""<div style="text-align:center;padding:10px;background:#f8fafc;
             border-radius:8px;margin:4px;border:1px solid #e2e8f0;">
             <div style="font-size:24px;">{e}</div>
             <div style="font-size:11px;color:#475569;">{a.replace('_',' ')}</div>
